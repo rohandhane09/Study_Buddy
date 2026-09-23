@@ -192,14 +192,20 @@ with st.sidebar:
     provider_name = st.selectbox("Provider", list(PROVIDERS.keys()), index=0)
     provider = PROVIDERS[provider_name]
 
-    default_key = os.environ.get("OPENAI_API_KEY", "") if "OpenAI" in provider_name else ""
-    api_key = st.text_input(
-        "API key",
-        value=default_key,
-        type="password",
-        help=f"Get a free key at {provider['key_url']}. It is only used for this session and is not stored.",
-    )
-    st.caption(f"🔑 Get a key: {provider['key_url']}")
+    # API keys are stored securely in Streamlit Community Cloud Secrets.
+    # For local development, environment variables are also supported.
+    if "Groq" in provider_name:
+        api_key = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
+    else:
+        api_key = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+
+    if api_key:
+        st.success("🔐 API key loaded securely")
+    else:
+        st.error(
+            "API key is not configured. Add the provider key in "
+            "Streamlit Cloud → App Settings → Secrets."
+        )
 
     model = st.selectbox("Model", provider["models"], index=0)
 
@@ -209,8 +215,8 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "Your notes and API key are used only to call the OpenAI API for this "
-        "session — nothing is saved to disk."
+        "🔒 Your API key is stored as a Streamlit Secret and is never shown "
+        "in the app interface or committed to GitHub."
     )
 
 
