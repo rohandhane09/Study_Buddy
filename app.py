@@ -1,384 +1,285 @@
-"""
-AI Study Buddy
---------------
-A simple Streamlit app that lets a student upload notes (PDF or .txt),
-then uses the OpenAI API to generate:
-  1. A clean summary
-  2. A multiple-choice quiz
-  3. A set of flashcards
-
-Run it with:
-    streamlit run app.py
-
-You will need an OpenAI API key. You can either:
-  - paste it into the sidebar box when the app opens, or
-  - set it as an environment variable called OPENAI_API_KEY before launching.
-"""
-
-import json
-import os
-
+import json, os, re, uuid
+from datetime import datetime, timezone
 import streamlit as st
 from openai import OpenAI
 from pypdf import PdfReader
+from supabase import create_client
 
+st.set_page_config(page_title='AI Study Buddy', page_icon='📚', layout='wide')
 
-# =========================================================
-# 1. PAGE SETUP
-# =========================================================
+# ---------- Login ----------
+if not st.user.is_logged_in:
+    st.markdown("<div style='text-align:center;padding:70px 20px 30px'><div style='font-size:64px'>📚</div><h1>AI Study Buddy</h1><p>Save your summaries, quizzes and flashcards and continue them later.</p></div>", unsafe_allow_html=True)
+    _, c, _ = st.columns([1,2,1])
+    with c:
+        st.button('🔐 Continue with Google', use_container_width=True, type='primary', on_click=st.login)
+    st.stop()
 
-st.set_page_config(page_title="AI Study Buddy", page_icon="📚", layout="wide")
+def uv(key, default=''):
+    try: return st.user.get(key) or default
+    except Exception: return default
 
-# Values that need to survive between button clicks live in st.session_state.
-# Without this, Streamlit would forget the notes/summary/quiz every time
-# you interact with the page.
+USER_ID = uv('sub') or uv('email')
+USER_EMAIL = uv('email', 'Unknown email')
+USER_NAME = uv('name') or uv('given_name') or 'Student'
+if not USER_ID:
+    st.error('Could not identify your Google account. Please sign in again.')
+    st.stop()
+
+# ---------- Session state ----------
 defaults = {
-    "notes_text": "",
-    "summary": "",
-    "quiz": None,
-    "flashcards": None,
-    "quiz_submitted": False,
+    'notes_text':'', 'summary':'', 'quiz':None, 'flashcards':None,
+    'quiz_submitted':False, 'quiz_answers':{}, 'quiz_score':None,
+    'current_session_id':None, 'current_session_title':'New Study Session'
 }
-for key, value in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
+for k,v in defaults.items():
+    if k not in st.session_state: st.session_state[k]=v
 
+def new_session():
+    for k,v in defaults.items(): st.session_state[k]=v
 
-# =========================================================
-# 2. HELPER FUNCTIONS
-# =========================================================
+def secret(name):
+    try: v=st.secrets.get(name)
+    except Exception: v=None
+    return v or os.environ.get(name,'')
 
-def extract_text_from_pdf(uploaded_file) -> str:
-    """Pull all the text out of an uploaded PDF file."""
-    reader = PdfReader(uploaded_file)
-    pages_text = []
-    for page in reader.pages:
-        pages_text.append(page.extract_text() or "")
-    return "\n".join(pages_text)
+# ---------- Supabase ----------
+SUPABASE_URL=secret('SUPABASE_URL')
+SUPABASE_KEY=secret('SUPABASE_KEY')
+if not SUPABASE_URL or not SUPABASE_KEY:
+    st.error('Supabase is not configured. Add SUPABASE_URL and SUPABASE_KEY to Streamlit Secrets.')
+    st.stop()
+try:
+    supabase=create_client(SUPABASE_URL,SUPABASE_KEY)
+except Exception as e:
+    st.error(f'Could not connect to Supabase: {e}')
+    st.stop()
 
+def title_from_notes(text, fallback='New Study Session'):
+    lines=[re.sub(r'^[#*\-\d.)\s]+','',x).strip() for x in text.splitlines()]
+    lines=[x for x in lines if x]
+    if not lines: return fallback
+    t=re.sub(r'\s+',' ',lines[0])
+    return t[:55].rstrip()+('...' if len(t)>55 else '')
 
-# Providers that speak the OpenAI-compatible chat API. Groq's free tier
-# needs no credit card at all, which is why it's listed first/default.
-PROVIDERS = {
-    "Groq (Free \u2014 no card needed)": {
-        "base_url": "https://api.groq.com/openai/v1",
-        "models": ["openai/gpt-oss-20b", "openai/gpt-oss-120b"],
-        "key_url": "https://console.groq.com/keys",
-    },
-    "OpenAI (paid)": {
-        "base_url": None,  # None = use OpenAI's default endpoint
-        "models": ["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
-        "key_url": "https://platform.openai.com/api-keys",
-    },
-}
-
-
-def get_client(api_key: str, base_url: str | None) -> OpenAI:
-    """Create a client for whichever provider was selected."""
-    if base_url:
-        return OpenAI(api_key=api_key, base_url=base_url)
-    return OpenAI(api_key=api_key)
-
-
-def ask_openai(client: OpenAI, model: str, system_prompt: str, user_prompt: str) -> str:
-    """Send one system+user prompt to the OpenAI chat API and return the text reply."""
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0.4,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    )
-    return response.choices[0].message.content
-
-
-def parse_json_safely(raw_text: str):
-    """
-    The model is asked to return JSON, but it sometimes wraps it in
-    ```json ... ``` code fences. This strips those off and parses it.
-    Returns None if the text still isn't valid JSON.
-    """
-    text = raw_text.strip()
-    if text.startswith("```"):
-        text = text.strip("`")
-        if text.lower().startswith("json"):
-            text = text[4:]
+def recent_sessions():
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
+        r=(supabase.table('study_sessions').select('id,title,updated_at,quiz_score,quiz_total')
+           .eq('user_id',USER_ID).order('updated_at',desc=True).limit(20).execute())
+        return r.data or []
+    except Exception as e:
+        st.sidebar.error(f'Could not load sessions: {e}'); return []
 
+def save_session():
+    if not st.session_state.notes_text.strip(): return None
+    if not st.session_state.current_session_title or st.session_state.current_session_title=='New Study Session':
+        st.session_state.current_session_title=title_from_notes(st.session_state.notes_text)
+    q=st.session_state.quiz
+    payload={
+        'user_id':USER_ID,'user_email':USER_EMAIL,'user_name':USER_NAME,
+        'title':st.session_state.current_session_title,
+        'notes_text':st.session_state.notes_text,
+        'summary':st.session_state.summary or '', 'quiz':q,
+        'flashcards':st.session_state.flashcards,
+        'quiz_submitted':bool(st.session_state.quiz_submitted),
+        'quiz_answers':st.session_state.quiz_answers or {},
+        'quiz_score':st.session_state.quiz_score,
+        'quiz_total':len(q) if isinstance(q,list) else None,
+        'updated_at':datetime.now(timezone.utc).isoformat()
+    }
+    try:
+        sid=st.session_state.current_session_id
+        if sid:
+            r=(supabase.table('study_sessions').update(payload).eq('id',sid).eq('user_id',USER_ID).execute())
+            if not r.data: sid=None
+        if not sid:
+            payload['id']=str(uuid.uuid4())
+            r=supabase.table('study_sessions').insert(payload).execute()
+            sid=r.data[0]['id']; st.session_state.current_session_id=sid
+        return sid
+    except Exception as e:
+        st.error(f'Could not save session: {e}'); return None
 
-# ---- The three "study buddy" prompts -----------------------------------
+def load_session(sid):
+    try:
+        r=(supabase.table('study_sessions').select('*').eq('id',sid).eq('user_id',USER_ID).single().execute())
+        x=r.data
+        if not x: return False
+        st.session_state.current_session_id=x['id']; st.session_state.current_session_title=x.get('title') or 'Study Session'
+        st.session_state.notes_text=x.get('notes_text') or ''; st.session_state.summary=x.get('summary') or ''
+        st.session_state.quiz=x.get('quiz'); st.session_state.flashcards=x.get('flashcards')
+        st.session_state.quiz_submitted=bool(x.get('quiz_submitted',False)); st.session_state.quiz_answers=x.get('quiz_answers') or {}
+        st.session_state.quiz_score=x.get('quiz_score'); return True
+    except Exception as e:
+        st.error(f'Could not load session: {e}'); return False
 
-def generate_summary(client, model, notes_text):
-    system_prompt = (
-        "You are a friendly, encouraging study assistant. You turn messy "
-        "student notes into clear, well-organized summaries."
-    )
-    user_prompt = f"""Summarize the following notes for a student who is studying for an exam.
+def delete_session(sid):
+    try:
+        supabase.table('study_sessions').delete().eq('id',sid).eq('user_id',USER_ID).execute()
+        if st.session_state.current_session_id==sid: new_session()
+        return True
+    except Exception as e:
+        st.error(f'Could not delete session: {e}'); return False
 
-Formatting rules:
-- Use short Markdown headings to group related ideas.
+# ---------- Existing AI logic ----------
+def extract_text_from_pdf(f):
+    return '\n'.join((p.extract_text() or '') for p in PdfReader(f).pages)
+
+PROVIDERS={
+    'Groq (Free — no card needed)':{'base_url':'https://api.groq.com/openai/v1','models':['openai/gpt-oss-20b','openai/gpt-oss-120b']},
+    'OpenAI (paid)':{'base_url':None,'models':['gpt-4o-mini','gpt-4o','gpt-4.1-mini']}
+}
+def client_for(key,url): return OpenAI(api_key=key,base_url=url) if url else OpenAI(api_key=key)
+def ask(client,model,system,user):
+    r=client.chat.completions.create(model=model,temperature=.4,messages=[{'role':'system','content':system},{'role':'user','content':user}])
+    return r.choices[0].message.content
+def parse_json(raw):
+    t=raw.strip()
+    if t.startswith('```'):
+        t=t.strip('`')
+        if t.lower().startswith('json'): t=t[4:]
+    try: return json.loads(t)
+    except json.JSONDecodeError: return None
+
+def generate_summary(c,m,n):
+    return ask(c,m,'You are a friendly, encouraging study assistant. You turn messy student notes into clear, well-organized summaries.',f'''Summarize the following notes for a student studying for an exam.
+- Use short Markdown headings.
 - Use bullet points, not long paragraphs.
-- **Bold** key terms and definitions.
-- Keep it concise: aim for roughly a third the length of the original notes.
+- Bold key terms and definitions.
+- Aim for roughly a third the length of the original.
 
-NOTES:
-\"\"\"
-{notes_text}
-\"\"\"
-"""
-    return ask_openai(client, model, system_prompt, user_prompt)
+NOTES:\n"""\n{n}\n"""''')
 
+def generate_quiz(c,m,n,count):
+    raw=ask(c,m,'You write multiple-choice quiz questions. Respond ONLY with valid JSON, no markdown fences.',f'''Read these notes and write {count} multiple-choice questions testing understanding.
+Return ONLY a JSON array exactly like:
+[{{"question":"What is ...?","options":["A) first","B) second","C) third","D) fourth"],"correct_answer":"A","explanation":"One short sentence explaining why."}}]
 
-def generate_quiz(client, model, notes_text, num_questions):
-    system_prompt = (
-        "You are a study assistant that writes multiple-choice quiz questions. "
-        "You respond with ONLY valid JSON, no explanations, no markdown fences."
-    )
-    user_prompt = f"""Read the notes below and write {num_questions} multiple-choice questions
-that test understanding of the material (not just trivial recall).
+NOTES:\n"""\n{n}\n"""''')
+    return parse_json(raw)
 
-Return ONLY a JSON array, formatted exactly like this example:
-[
-  {{
-    "question": "What is ...?",
-    "options": ["A) first option", "B) second option", "C) third option", "D) fourth option"],
-    "correct_answer": "A",
-    "explanation": "One short sentence explaining why."
-  }}
-]
+def generate_flashcards(c,m,n,count):
+    raw=ask(c,m,'You write concise active-recall flashcards. Respond ONLY with valid JSON, no markdown fences.',f'''Read these notes and create {count} flashcards. Each has a short front and back.
+Return ONLY a JSON array like:
+[{{"front":"What is photosynthesis?","back":"The process plants use to turn light into energy."}}]
 
-NOTES:
-\"\"\"
-{notes_text}
-\"\"\"
-"""
-    raw = ask_openai(client, model, system_prompt, user_prompt)
-    return parse_json_safely(raw)
+NOTES:\n"""\n{n}\n"""''')
+    return parse_json(raw)
 
-
-def generate_flashcards(client, model, notes_text, num_cards):
-    system_prompt = (
-        "You are a study assistant that writes flashcards for active-recall practice. "
-        "You respond with ONLY valid JSON, no explanations, no markdown fences."
-    )
-    user_prompt = f"""Read the notes below and create {num_cards} flashcards.
-Each flashcard has a short "front" (a question or term) and a short "back" (the answer or definition).
-
-Return ONLY a JSON array, formatted exactly like this example:
-[
-  {{"front": "What is photosynthesis?", "back": "The process plants use to turn light into energy."}}
-]
-
-NOTES:
-\"\"\"
-{notes_text}
-\"\"\"
-"""
-    raw = ask_openai(client, model, system_prompt, user_prompt)
-    return parse_json_safely(raw)
-
-
-# =========================================================
-# 3. SIDEBAR — SETTINGS
-# =========================================================
-
+# ---------- Sidebar ----------
 with st.sidebar:
-    st.header("⚙️ Settings")
-
-    provider_name = st.selectbox("Provider", list(PROVIDERS.keys()), index=0)
-    provider = PROVIDERS[provider_name]
-
-    # API keys are stored securely in Streamlit Community Cloud Secrets.
-    # For local development, environment variables are also supported.
-    if "Groq" in provider_name:
-        api_key = st.secrets.get("GROQ_API_KEY", os.environ.get("GROQ_API_KEY", ""))
-    else:
-        api_key = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-
-    if api_key:
-        st.success("🔐 API key loaded securely")
-    else:
-        st.error(
-            "API key is not configured. Add the provider key in "
-            "Streamlit Cloud → App Settings → Secrets."
-        )
-
-    model = st.selectbox("Model", provider["models"], index=0)
-
+    st.header('👤 Account')
+    st.write(f'**{USER_NAME}**')
+    st.caption(USER_EMAIL)
+    st.button('🚪 Log out',use_container_width=True,on_click=st.logout)
     st.divider()
-    num_quiz_questions = st.slider("Number of quiz questions", 3, 15, 5)
-    num_flashcards = st.slider("Number of flashcards", 5, 25, 10)
+    st.header('🕘 Recent Sessions')
+    if st.button('➕ New Study Session',use_container_width=True): new_session(); st.rerun()
+    rows=recent_sessions()
+    if rows:
+        options={'— Select a session —':None}
+        for r in rows:
+            label=r['title']
+            if label in options: label=f"{label} ({str(r['id'])[:6]})"
+            options[label]=r['id']
+        chosen=st.selectbox('Open a previous session',list(options.keys()))
+        if options[chosen]:
+            a,b=st.columns(2)
+            with a:
+                if st.button('📂 Open',use_container_width=True):
+                    if load_session(options[chosen]): st.rerun()
+            with b:
+                if st.button('🗑️ Delete',use_container_width=True):
+                    if delete_session(options[chosen]): st.rerun()
+    else: st.caption('No saved sessions yet.')
+    if st.session_state.current_session_id: st.caption(f"Current: **{st.session_state.current_session_title}**")
+    st.divider(); st.header('⚙️ Settings')
+    provider_name=st.selectbox('Provider',list(PROVIDERS.keys()),index=0); provider=PROVIDERS[provider_name]
+    api_key=secret('GROQ_API_KEY' if 'Groq' in provider_name else 'OPENAI_API_KEY')
+    if api_key: st.success('🔐 API key loaded securely')
+    else: st.error('API key is not configured. Add it to Streamlit Secrets.')
+    model=st.selectbox('Model',provider['models'],index=0)
+    st.divider(); num_quiz_questions=st.slider('Number of quiz questions',3,15,5); num_flashcards=st.slider('Number of flashcards',5,25,10)
 
-    st.divider()
-    st.caption(
-        "🔒 Your API key is stored as a Streamlit Secret and is never shown "
-        "in the app interface or committed to GitHub."
-    )
-
-
-# =========================================================
-# 4. MAIN PAGE — TITLE + NOTES INPUT
-# =========================================================
-
-st.title("📚 AI Study Buddy")
-st.write("Upload your notes, then generate a summary, a quiz, and flashcards — all in one place.")
-
-MAX_CHARS = 20000  # keeps requests fast and affordable
-
-st.subheader("1. Add your notes")
-tab_upload, tab_paste = st.tabs(["📄 Upload a file", "✍️ Paste text"])
-
+# ---------- Main ----------
+st.title('📚 AI Study Buddy')
+st.write(f'Welcome, **{USER_NAME}**! Upload notes and create a summary, quiz and flashcards.')
+MAX_CHARS=20000
+st.subheader('1. Add your notes')
+tab_upload,tab_paste=st.tabs(['📄 Upload a file','✍️ Paste text'])
 with tab_upload:
-    uploaded_file = st.file_uploader("Upload a PDF or .txt file", type=["pdf", "txt"])
-    if uploaded_file is not None:
-        if uploaded_file.type == "application/pdf":
-            extracted = extract_text_from_pdf(uploaded_file)
-        else:
-            extracted = uploaded_file.read().decode("utf-8", errors="ignore")
-
-        if extracted.strip():
-            st.session_state.notes_text = extracted
-            st.success(f"Loaded {len(extracted):,} characters from **{uploaded_file.name}**.")
-        else:
-            st.error("Couldn't find any text in that file. Try a different file or paste text instead.")
-
+    uploaded=st.file_uploader('Upload a PDF or .txt file',type=['pdf','txt'])
+    if uploaded:
+        text=extract_text_from_pdf(uploaded) if uploaded.type=='application/pdf' else uploaded.read().decode('utf-8',errors='ignore')
+        if text.strip():
+            st.session_state.notes_text=text
+            if not st.session_state.current_session_id or st.session_state.current_session_title=='New Study Session':
+                st.session_state.current_session_title=title_from_notes(text,uploaded.name.rsplit('.',1)[0])
+            st.success(f'Loaded {len(text):,} characters from **{uploaded.name}**.')
+        else: st.error("Couldn't find any text in that file.")
 with tab_paste:
-    pasted = st.text_area("Paste your notes here", height=200, value="")
-    if st.button("Use this text"):
+    pasted=st.text_area('Paste your notes here',height=200)
+    if st.button('Use this text'):
         if pasted.strip():
-            st.session_state.notes_text = pasted
-            st.success(f"Loaded {len(pasted):,} characters of pasted text.")
-        else:
-            st.warning("Please paste some text first.")
-
-# Show a preview + length check
+            st.session_state.notes_text=pasted
+            if not st.session_state.current_session_id or st.session_state.current_session_title=='New Study Session': st.session_state.current_session_title=title_from_notes(pasted)
+            st.success(f'Loaded {len(pasted):,} characters.')
+        else: st.warning('Please paste some text first.')
 if st.session_state.notes_text:
-    with st.expander("Preview loaded notes"):
-        st.text(st.session_state.notes_text[:2000] + ("..." if len(st.session_state.notes_text) > 2000 else ""))
-
-    if len(st.session_state.notes_text) > MAX_CHARS:
-        st.warning(
-            f"Your notes are {len(st.session_state.notes_text):,} characters long. "
-            f"Only the first {MAX_CHARS:,} characters will be used, to keep things fast and affordable."
-        )
-
+    with st.expander('Preview loaded notes'):
+        p=st.session_state.notes_text[:2000]; st.text(p+('...' if len(st.session_state.notes_text)>2000 else ''))
+    if len(st.session_state.notes_text)>MAX_CHARS: st.warning(f'Only the first {MAX_CHARS:,} characters will be sent to the AI.')
+st.divider(); st.subheader('2. Generate study materials')
+ready=bool(st.session_state.notes_text.strip()) and bool(api_key.strip()); n=st.session_state.notes_text[:MAX_CHARS]
+c1,c2,c3=st.columns(3)
+with c1:
+    if st.button('📝 Generate Summary',use_container_width=True,disabled=not ready):
+        with st.spinner('Summarizing your notes...'): st.session_state.summary=generate_summary(client_for(api_key,provider['base_url']),model,n)
+        save_session(); st.success('Summary saved to Recent Sessions.')
+with c2:
+    if st.button('❓ Generate Quiz',use_container_width=True,disabled=not ready):
+        with st.spinner('Writing quiz questions...'): st.session_state.quiz=generate_quiz(client_for(api_key,provider['base_url']),model,n,num_quiz_questions)
+        st.session_state.quiz_submitted=False; st.session_state.quiz_answers={}; st.session_state.quiz_score=None; save_session(); st.success('Quiz saved to Recent Sessions.')
+with c3:
+    if st.button('🃏 Generate Flashcards',use_container_width=True,disabled=not ready):
+        with st.spinner('Making flashcards...'): st.session_state.flashcards=generate_flashcards(client_for(api_key,provider['base_url']),model,n,num_flashcards)
+        save_session(); st.success('Flashcards saved to Recent Sessions.')
 st.divider()
 
-# =========================================================
-# 5. GENERATE BUTTONS
-# =========================================================
-
-st.subheader("2. Generate study materials")
-
-notes_ready = bool(st.session_state.notes_text.strip())
-key_ready = bool(api_key.strip())
-
-if not notes_ready:
-    st.info("Add your notes above to unlock the buttons below.")
-elif not key_ready:
-    st.info("Enter your OpenAI API key in the sidebar to unlock the buttons below.")
-
-col1, col2, col3 = st.columns(3)
-notes_for_ai = st.session_state.notes_text[:MAX_CHARS]
-
-with col1:
-    if st.button("📝 Generate Summary", use_container_width=True, disabled=not (notes_ready and key_ready)):
-        with st.spinner("Summarizing your notes..."):
-            client = get_client(api_key, provider["base_url"])
-            st.session_state.summary = generate_summary(client, model, notes_for_ai)
-
-with col2:
-    if st.button("❓ Generate Quiz", use_container_width=True, disabled=not (notes_ready and key_ready)):
-        with st.spinner("Writing quiz questions..."):
-            client = get_client(api_key, provider["base_url"])
-            st.session_state.quiz = generate_quiz(client, model, notes_for_ai, num_quiz_questions)
-            st.session_state.quiz_submitted = False
-
-with col3:
-    if st.button("🃏 Generate Flashcards", use_container_width=True, disabled=not (notes_ready and key_ready)):
-        with st.spinner("Making flashcards..."):
-            client = get_client(api_key, provider["base_url"])
-            st.session_state.flashcards = generate_flashcards(client, model, notes_for_ai, num_flashcards)
-
-st.divider()
-
-# =========================================================
-# 6. RESULTS — SUMMARY / QUIZ / FLASHCARDS
-# =========================================================
-
-result_tabs = st.tabs(["📝 Summary", "❓ Quiz", "🃏 Flashcards"])
-
-# --- Summary tab ---------------------------------------------------------
-with result_tabs[0]:
-    if st.session_state.summary:
-        st.markdown(st.session_state.summary)
+# ---------- Results ----------
+t1,t2,t3=st.tabs(['📝 Summary','❓ Quiz','🃏 Flashcards'])
+with t1:
+    st.markdown(st.session_state.summary) if st.session_state.summary else st.caption("Your summary will appear here once you click 'Generate Summary'.")
+with t2:
+    quiz=st.session_state.quiz
+    if quiz is None: st.caption("Your quiz will appear here once you click 'Generate Quiz'.")
+    elif not isinstance(quiz,list) or not quiz: st.error('The quiz is empty or invalid. Try generating it again.')
     else:
-        st.caption("Your summary will appear here once you click 'Generate Summary'.")
-
-# --- Quiz tab -------------------------------------------------------------
-with result_tabs[1]:
-    quiz = st.session_state.quiz
-    if quiz is None:
-        st.caption("Your quiz will appear here once you click 'Generate Quiz'.")
-    elif isinstance(quiz, list) and len(quiz) == 0:
-        st.warning("The quiz came back empty. Try generating it again.")
-    elif not isinstance(quiz, list):
-        st.error("Something went wrong reading the quiz. Try generating it again.")
-    else:
-        with st.form("quiz_form"):
-            user_answers = {}
-            for i, q in enumerate(quiz):
-                st.markdown(f"**{i + 1}. {q.get('question', '')}**")
-                options = q.get("options", [])
-                # store just the letter (A/B/C/D) the user picked
-                choice = st.radio(
-                    label="Choose one:",
-                    options=[opt[0] for opt in options],  # "A", "B", "C", "D"
-                    format_func=lambda letter, opts=options: next(
-                        (o for o in opts if o.startswith(letter)), letter
-                    ),
-                    key=f"quiz_q_{i}",
-                    index=None,
-                    label_visibility="collapsed",
-                )
-                user_answers[i] = choice
-                st.write("")
-
-            submitted = st.form_submit_button("✅ Check my answers")
-            if submitted:
-                st.session_state.quiz_submitted = True
-
+        with st.form('quiz_form'):
+            answers={}
+            for i,q in enumerate(quiz):
+                st.markdown(f"**{i+1}. {q.get('question','')}**"); opts=q.get('options',[])
+                answers[i]=st.radio('Choose one:',[o[0] for o in opts],format_func=lambda letter,opts=opts: next((o for o in opts if o.startswith(letter)),letter),key=f"quiz_{st.session_state.current_session_id}_{i}",index=None,label_visibility='collapsed')
+            submitted=st.form_submit_button('✅ Check my answers')
+        if submitted:
+            st.session_state.quiz_answers={str(k):v for k,v in answers.items()}
+            st.session_state.quiz_score=sum(answers.get(i)==q.get('correct_answer','') for i,q in enumerate(quiz))
+            st.session_state.quiz_submitted=True; save_session(); st.rerun()
         if st.session_state.quiz_submitted:
-            score = 0
-            st.markdown("### Results")
-            for i, q in enumerate(quiz):
-                correct = q.get("correct_answer", "")
-                given = user_answers.get(i)
-                is_correct = given == correct
-                score += int(is_correct)
-                icon = "✅" if is_correct else "❌"
-                st.markdown(f"{icon} **Q{i + 1}:** correct answer is **{correct}** — {q.get('explanation', '')}")
-            st.success(f"Score: {score} / {len(quiz)}")
-
-# --- Flashcards tab ---------------------------------------------------------
-with result_tabs[2]:
-    cards = st.session_state.flashcards
-    if cards is None:
-        st.caption("Your flashcards will appear here once you click 'Generate Flashcards'.")
-    elif isinstance(cards, list) and len(cards) == 0:
-        st.warning("The flashcards came back empty. Try generating them again.")
-    elif not isinstance(cards, list):
-        st.error("Something went wrong reading the flashcards. Try generating them again.")
+            score=st.session_state.quiz_score or 0; st.markdown('### Results')
+            for i,q in enumerate(quiz):
+                given=st.session_state.quiz_answers.get(str(i)); correct=q.get('correct_answer',''); icon='✅' if given==correct else '❌'
+                st.markdown(f"{icon} **Q{i+1}:** correct answer is **{correct}** — {q.get('explanation','')}")
+            st.success(f'Score: {score} / {len(quiz)}')
+with t3:
+    cards=st.session_state.flashcards
+    if cards is None: st.caption("Your flashcards will appear here once you click 'Generate Flashcards'.")
+    elif not isinstance(cards,list) or not cards: st.error('The flashcards are empty or invalid. Try generating them again.')
     else:
-        st.caption("Click a card to reveal the answer.")
-        # Show cards in a simple two-column grid using expanders as "flip" cards.
-        left, right = st.columns(2)
-        for i, card in enumerate(cards):
-            target_col = left if i % 2 == 0 else right
-            with target_col:
-                with st.expander(f"🃏 {card.get('front', '')}"):
-                    st.write(card.get("back", ""))
+        st.caption('Click a card to reveal the answer.'); left,right=st.columns(2)
+        for i,card in enumerate(cards):
+            with (left if i%2==0 else right):
+                with st.expander(f"🃏 {card.get('front','')}"): st.write(card.get('back',''))
+
+if st.session_state.current_session_id:
+    st.divider(); st.caption(f"☁️ Saved in Supabase as **{st.session_state.current_session_title}**")
