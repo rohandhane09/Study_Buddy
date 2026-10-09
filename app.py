@@ -247,42 +247,75 @@ with c3:
 st.divider()
 
 # ---------- Results ----------
-t1,t2,t3=st.tabs(['📝 Summary','❓ Quiz','🃏 Flashcards'])
+t1, t2, t3 = st.tabs(['📝 Summary', '❓ Quiz', '🃏 Flashcards'])
+
 with t1:
-   if st.session_state.summary:
-    st.markdown(st.session_state.summary)
-else:
-    st.caption("Your summary will appear here once you click 'Generate Summary'.")
+    if st.session_state.summary:
+        st.markdown(st.session_state.summary)
+    else:
+        st.caption("Your summary will appear here once you click 'Generate Summary'.")
+
 with t2:
-    quiz=st.session_state.quiz
-    if quiz is None: st.caption("Your quiz will appear here once you click 'Generate Quiz'.")
-    elif not isinstance(quiz,list) or not quiz: st.error('The quiz is empty or invalid. Try generating it again.')
+    quiz = st.session_state.quiz
+
+    if quiz is None:
+        st.caption("Your quiz will appear here once you click 'Generate Quiz'.")
+    elif not isinstance(quiz, list) or not quiz:
+        st.error('The quiz is empty or invalid. Try generating it again.')
     else:
         with st.form('quiz_form'):
-            answers={}
-            for i,q in enumerate(quiz):
-                st.markdown(f"**{i+1}. {q.get('question','')}**"); opts=q.get('options',[])
-                answers[i]=st.radio('Choose one:',[o[0] for o in opts],format_func=lambda letter,opts=opts: next((o for o in opts if o.startswith(letter)),letter),key=f"quiz_{st.session_state.current_session_id}_{i}",index=None,label_visibility='collapsed')
-            submitted=st.form_submit_button('✅ Check my answers')
+            answers = {}
+            for i, q in enumerate(quiz):
+                st.markdown(f"**{i + 1}. {q.get('question', '')}**")
+                opts = q.get('options', [])
+                answers[i] = st.radio(
+                    'Choose one:',
+                    [o[0] for o in opts],
+                    format_func=lambda letter, opts=opts: next(
+                        (o for o in opts if o.startswith(letter)), letter
+                    ),
+                    key=f"quiz_{st.session_state.current_session_id}_{i}",
+                    index=None,
+                    label_visibility='collapsed'
+                )
+            submitted = st.form_submit_button('✅ Check my answers')
+
         if submitted:
-            st.session_state.quiz_answers={str(k):v for k,v in answers.items()}
-            st.session_state.quiz_score=sum(answers.get(i)==q.get('correct_answer','') for i,q in enumerate(quiz))
-            st.session_state.quiz_submitted=True; save_session(); st.rerun()
+            st.session_state.quiz_answers = {str(k): v for k, v in answers.items()}
+            st.session_state.quiz_score = sum(
+                answers.get(i) == q.get('correct_answer', '')
+                for i, q in enumerate(quiz)
+            )
+            st.session_state.quiz_submitted = True
+            save_session()
+            st.rerun()
+
         if st.session_state.quiz_submitted:
-            score=st.session_state.quiz_score or 0; st.markdown('### Results')
-            for i,q in enumerate(quiz):
-                given=st.session_state.quiz_answers.get(str(i)); correct=q.get('correct_answer',''); icon='✅' if given==correct else '❌'
-                st.markdown(f"{icon} **Q{i+1}:** correct answer is **{correct}** — {q.get('explanation','')}")
+            score = st.session_state.quiz_score or 0
+            st.markdown('### Results')
+            for i, q in enumerate(quiz):
+                given = st.session_state.quiz_answers.get(str(i))
+                correct = q.get('correct_answer', '')
+                icon = '✅' if given == correct else '❌'
+                st.markdown(
+                    f"{icon} **Q{i + 1}:** correct answer is **{correct}** — "
+                    f"{q.get('explanation', '')}"
+                )
             st.success(f'Score: {score} / {len(quiz)}')
+
 with t3:
-    cards=st.session_state.flashcards
-    if cards is None: st.caption("Your flashcards will appear here once you click 'Generate Flashcards'.")
-    elif not isinstance(cards,list) or not cards: st.error('The flashcards are empty or invalid. Try generating them again.')
+    cards = st.session_state.flashcards
+    if cards is None:
+        st.caption("Your flashcards will appear here once you click 'Generate Flashcards'.")
+    elif not isinstance(cards, list) or not cards:
+        st.error('The flashcards are empty or invalid. Try generating them again.')
     else:
-        st.caption('Click a card to reveal the answer.'); left,right=st.columns(2)
-        for i,card in enumerate(cards):
-            with (left if i%2==0 else right):
-                with st.expander(f"🃏 {card.get('front','')}"): st.write(card.get('back',''))
+        st.caption('Click a card to reveal the answer.')
+        left, right = st.columns(2)
+        for i, card in enumerate(cards):
+            with (left if i % 2 == 0 else right):
+                with st.expander(f"🃏 {card.get('front', '')}"):
+                    st.write(card.get('back', ''))
 
 if st.session_state.current_session_id:
     st.divider(); st.caption(f"☁️ Saved in Supabase as **{st.session_state.current_session_title}**")
