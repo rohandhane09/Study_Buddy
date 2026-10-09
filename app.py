@@ -249,7 +249,10 @@ st.divider()
 # ---------- Results ----------
 t1,t2,t3=st.tabs(['📝 Summary','❓ Quiz','🃏 Flashcards'])
 with t1:
-    st.markdown(st.session_state.summary) if st.session_state.summary else st.caption("Your summary will appear here once you click 'Generate Summary'.")
+   if st.session_state.summary:
+    st.markdown(st.session_state.summary)
+else:
+    st.caption("Your summary will appear here once you click 'Generate Summary'.")
 with t2:
     quiz=st.session_state.quiz
     if quiz is None: st.caption("Your quiz will appear here once you click 'Generate Quiz'.")
