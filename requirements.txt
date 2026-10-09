@@ -1,3 +1,5 @@
-streamlit>=1.35
+streamlit>=1.42
+Authlib>=1.3.2
 openai>=1.30
 pypdf>=4.2
+supabase>=2.0
